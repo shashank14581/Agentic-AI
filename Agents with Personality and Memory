@@ -1,0 +1,108 @@
+import os
+from google import genai
+from google.genai import types
+
+
+class BaseAgent():
+    def __init__(self, name, sys_prompt, model="gemini-2.5-flash-lite"):
+        self.name = name
+        self.sys_prompt = sys_prompt
+        self.memory = []
+        self.facts_store = []   # renamed to avoid conflict
+        self.client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+        self.model = model
+
+    def build_context(self, input_text):
+        # last 3 interactions
+        history = ""
+        for inp, out in self.memory[-3:]:
+            history += f"user: {inp}\nsystem: {out}\n"
+
+        facts_text = "\n".join(self.facts_store)
+
+        full_input = f"""
+FACTS:
+{facts_text}
+
+HISTORY:
+{history}
+
+NEW MESSAGE:
+{input_text}
+"""
+        return full_input
+
+    def extract_facts(self, input_text):
+        if "I am" in input_text or "I like" in input_text:
+            if input_text not in self.facts_store:
+                self.facts_store.append(input_text)
+
+    def think(self, input_text):
+        # extract facts first
+        self.extract_facts(input_text)
+
+        full_input = self.build_context(input_text)
+
+        contents = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=full_input)]
+            )
+        ]
+
+        config = types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            system_instruction=[types.Part.from_text(text=self.sys_prompt)]
+        )
+
+        response = ""
+
+        for chunk in self.client.models.generate_content_stream(
+            model=self.model,
+            contents=contents,
+            config=config
+        ):
+            if chunk.text:
+                print(chunk.text, end="")
+                response += chunk.text
+
+        print()
+
+        self.memory.append((input_text, response))
+        return response
+
+
+class Human(BaseAgent):
+    def __init__(self, name):
+        super().__init__(
+            name,
+            f"You are {name}, a human. Talk naturally and casually."
+        )
+
+
+class God(BaseAgent):
+    def __init__(self, name):
+        super().__init__(
+            name,
+            f"You are {name}, a Hindu God. Be divine, wise, slightly playful."
+        )
+
+
+def orchestrate(human, god, turns=5):
+    message = "Hi Indra!"
+
+    for _ in range(turns):
+        print(f"\n{human.name}: ", end="")
+        human_out = human.think(message)
+
+        print(f"\n{god.name}: ", end="")
+        god_out = god.think(human_out)
+
+        message = god_out
+
+
+if __name__ == "__main__":
+    human = Human("Shashank")
+    god = God("Indra")
+
+    orchestrate(human, god)
