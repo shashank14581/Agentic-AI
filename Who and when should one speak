@@ -1,0 +1,191 @@
+import os
+from google import genai
+from google.genai import types
+
+
+# =========================
+# Base Agent
+# =========================
+class BaseAgent():
+    def __init__(self, name, sys_prompt, model="gemini-2.5-flash-lite"):
+        self.name = name
+        self.sys_prompt = sys_prompt
+        self.memory = []
+        self.facts_store = []
+        self.client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+        self.model = model
+
+    def build_context(self, input_text):
+        history = ""
+        for inp, out in self.memory[-3:]:
+            history += f"user: {inp}\nsystem: {out}\n"
+
+        facts_text = "\n".join(self.facts_store)
+
+        return f"""
+FACTS:
+{facts_text}
+
+HISTORY:
+{history}
+
+NEW MESSAGE:
+{input_text}
+"""
+
+    def extract_facts(self, input_text):
+        if "I am" in input_text or "I like" in input_text:
+            if input_text not in self.facts_store:
+                self.facts_store.append(input_text)
+
+    def think(self, input_text):
+        self.extract_facts(input_text)
+        full_input = self.build_context(input_text)
+
+        contents = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=full_input)]
+            )
+        ]
+
+        config = types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            system_instruction=[types.Part.from_text(text=self.sys_prompt)]
+        )
+
+        response = ""
+
+        for chunk in self.client.models.generate_content_stream(
+            model=self.model,
+            contents=contents,
+            config=config
+        ):
+            if chunk.text:
+                print(chunk.text, end="")
+                response += chunk.text
+
+        print()
+        self.memory.append((input_text, response))
+        return response
+
+
+# =========================
+# Agents
+# =========================
+class Human(BaseAgent):
+    def __init__(self, name):
+        super().__init__(
+            name,
+            f"You are {name}, a human. Talk naturally and casually."
+        )
+
+
+class God(BaseAgent):
+    def __init__(self, name):
+        super().__init__(
+            name,
+            f"You are {name}, a Hindu God. Be divine, wise, slightly playful."
+        )
+
+
+class Dog(BaseAgent):
+    def __init__(self, name):
+        super().__init__(
+            name,
+            f"You are {name}, a dog. Be funny, emotional, loyal, slightly chaotic."
+        )
+
+
+class Philosopher(BaseAgent):
+    def __init__(self, name):
+        super().__init__(
+            name,
+            f"You are {name}, a philosopher. Be deep, abstract, reflective."
+        )
+
+
+# =========================
+# Moderator (THE BRAIN)
+# =========================
+class Moderator(BaseAgent):
+    def __init__(self):
+        super().__init__(
+            "Moderator",
+            """
+You are a moderator.
+
+Decide:
+- Which agent should respond
+
+Options:
+- Human
+- God
+- Dog
+- Philosopher
+
+Return ONLY one word.
+"""
+        )
+
+    def decide(self, input_text):
+        decision = self.think(input_text)
+
+        decision = decision.strip().lower()
+
+        if "god" in decision:
+            return "God"
+        elif "dog" in decision:
+            return "Dog"
+        elif "philosopher" in decision:
+            return "Philosopher"
+        else:
+            return "Human"
+
+
+# =========================
+# Orchestrator
+# =========================
+def orchestrate(agents, moderator, turns=6):
+    message = "Hi Indra, what is life?"
+
+    for _ in range(turns):
+
+        print("\n--- Moderator deciding ---")
+        decision = moderator.decide(message)
+
+        print(f"\n[Selected Agent]: {decision}\n")
+
+        if decision == "God":
+            agent = agents["God"]
+        elif decision == "Dog":
+            agent = agents["Dog"]
+        elif decision == "Philosopher":
+            agent = agents["Philosopher"]
+        else:
+            agent = agents["Human"]
+
+        print(f"{agent.name}: ", end="")
+        output = agent.think(message)
+
+        message = output
+
+
+# =========================
+# Main
+# =========================
+if __name__ == "__main__":
+    human = Human("Shashank")
+    god = God("Indra")
+    dog = Dog("Buddy")
+    philosopher = Philosopher("Socrates")
+    moderator = Moderator()
+
+    agents = {
+        "Human": human,
+        "God": god,
+        "Dog": dog,
+        "Philosopher": philosopher
+    }
+
+    orchestrate(agents, moderator)
