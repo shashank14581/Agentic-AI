@@ -8,7 +8,7 @@ class BaseAgent():
         self.name = name
         self.sys_prompt = sys_prompt
         self.memory = []
-        self.facts_store = []   # renamed to avoid conflict
+        self.facts_store = []   # renamed to avoid conflict -
         self.client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
         self.model = model
 
