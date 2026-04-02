@@ -1,0 +1,187 @@
+import os
+import json
+from google import genai
+from google.genai import types
+
+# os.environ["GEMINI_API_KEY"] = "your_api_key"
+
+
+# -------- BASE AGENT --------
+
+class BaseAgent():
+    def __init__(self, name, sys_prompt, model="gemini-2.5-flash"):
+        self.name = name
+        self.sys_prompt = sys_prompt
+        self.memory = []
+        self.client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+        self.model = model
+
+    def think(self, input_text):
+        if not input_text:
+            input_text = "continue"
+
+        contents = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=input_text)]
+            )
+        ]
+        config = types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            system_instruction=[types.Part.from_text(text = self.sys_prompt)]
+        )
+        response = ""
+        for chunk in self.client.models.generate_content_stream(
+            model=self.model,
+            contents=contents,
+            config=config
+        ):
+            if chunk.text:
+                response += chunk.text
+
+        self.memory.append((input_text, response))
+        return response
+
+
+# -------- HANDOFF AGENT --------
+# Every agent in this pattern returns JSON with a handoff_to field.
+# The agent decides who should speak next — not the orchestrator.
+
+class HandoffAgent(BaseAgent):
+    def __init__(self, name, persona, peers):
+        """
+        name    : this agent's name
+        persona : personality instruction
+        peers   : list of other agent names this agent can hand off to
+        """
+        peer_list = ", ".join(peers)
+        super().__init__(
+            name,
+            f"""{persona}
+
+You are part of a multi-agent conversation. After responding, you must decide who speaks next.
+
+Available agents to hand off to: {peer_list}
+
+You MUST return ONLY a JSON object. No explanation, no markdown, no backticks.
+
+Schema:
+{{
+  "message": "your actual response here",
+  "handoff_to": "name of the next agent from the available list",
+  "reason": "one sentence — why you are passing control to them"
+}}
+
+Rules:
+- handoff_to must be one of: {peer_list}
+- Never hand off to yourself
+- Return only valid JSON. Nothing else."""
+        )
+
+    def think_and_handoff(self, input_text):
+        raw = self.think(input_text)
+
+        # -------- SAFE JSON PARSE --------
+        clean = raw.strip()
+        if clean.startswith("```"):
+            clean = clean.split("```")[1]
+            if clean.startswith("json"):
+                clean = clean[4:]
+        clean = clean.strip()
+
+        try:
+            parsed = json.loads(clean)
+            return parsed
+        except json.JSONDecodeError:
+            # Fallback — if JSON parse fails, keep conversation alive
+            return {
+                "message": raw,
+                "handoff_to": None,
+                "reason": "parse error — orchestrator will decide next agent"
+            }
+
+
+# -------- AGENTS --------
+
+class Human(HandoffAgent):
+    def __init__(self, name, peers):
+        super().__init__(
+            name,
+            f"You are {name}, a human. Talk naturally and curiously.",
+            peers
+        )
+
+class Dog(HandoffAgent):
+    def __init__(self, name, peers):
+        super().__init__(
+            name,
+            f"You are {name}, a playful dog. You bark, wag, and are enthusiastic.",
+            peers
+        )
+
+class Vet(HandoffAgent):
+    def __init__(self, name, peers):
+        super().__init__(
+            name,
+            f"You are {name}, a veterinarian. You give calm, expert advice about animals.",
+            peers
+        )
+
+
+# -------- ORCHESTRATOR --------
+# The orchestrator does NOT decide who speaks.
+# It reads handoff_to from the agent's JSON and routes accordingly.
+
+def orchestrate(agents, starter_name, opening_message, turns=6):
+    """
+    agents        : dict of name -> HandoffAgent
+    starter_name  : which agent speaks first
+    opening_message: the first message
+    turns         : max number of turns before stopping
+    """
+    current_name = starter_name
+    message = opening_message
+
+    for i in range(turns):
+        print(f"\n{'='*50}")
+        print(f"Turn {i+1} | Speaker: {current_name}")
+        print(f"{'='*50}")
+
+        current_agent = agents[current_name]
+        result = current_agent.think_and_handoff(message)
+
+        # -------- PRINT OUTPUT --------
+        print(f"\n{current_name}: {result.get('message', '')}")
+        print(f"\n→ Handing off to: {result.get('handoff_to')} | Reason: {result.get('reason')}")
+
+        # -------- ROUTE --------
+        next_name = result.get("handoff_to")
+
+        if not next_name or next_name not in agents:
+            print(f"\n[Orchestrator] Invalid handoff target '{next_name}'. Stopping.")
+            break
+
+        # The next agent receives the current agent's message as input
+        message = result.get("message", "continue")
+        current_name = next_name
+
+
+# -------- MAIN --------
+
+if __name__ == "__main__":
+    human = Human("Shashank", peers=["Bruno", "DrMehra"])
+    dog   = Dog("Bruno",      peers=["Shashank", "DrMehra"])
+    vet   = Vet("DrMehra",    peers=["Shashank", "Bruno"])
+
+    agents = {
+        "Shashank": human,
+        "Bruno":    dog,
+        "DrMehra":  vet
+    }
+
+    orchestrate(
+        agents=agents,
+        starter_name="Shashank",
+        opening_message="Bruno hasn't been eating well lately. I'm a bit worried.",
+        turns=6
+    )
