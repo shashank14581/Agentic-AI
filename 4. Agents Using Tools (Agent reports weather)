@@ -4,45 +4,40 @@ from google import genai
 from google.genai import types
 
 
-# -------- TOOLS --------
+# -------- REAL TOOL --------
 
-def get_weather(city: str) -> str:
-    # Step 1: geocode city name to lat/lon
+def get_weather(city):
     geo = requests.get(
-        "https://geocoding-api.open-meteo.com/v1/search",
-        params={"name": city, "count": 1}
+        f"https://geocoding-api.open-meteo.com/v1/search?name={city}"
     ).json()
-    
-    if not geo.get("results"):
-        return f"Could not find city: {city}"
-    
+
+    if "results" not in geo:
+        return f"{city} not found"
+
     lat = geo["results"][0]["latitude"]
     lon = geo["results"][0]["longitude"]
-    
-    # Step 2: get current temperature
+
     weather = requests.get(
-        "https://api.open-meteo.com/v1/forecast",
-        params={
-            "latitude": lat,
-            "longitude": lon,
-            "current_weather": True
-        }
+        f"https://api.open-meteo.com/v1/forecast?"
+        f"latitude={lat}&longitude={lon}&current_weather=true"
     ).json()
-    
-    temp = weather["current_weather"]["temperature"]
-    return f"Weather in {city} is {temp}°C"
+
+    data = weather.get("current_weather", {})
+    return f"{city}: {data.get('temperature')}°C"
+
+
 def add_numbers(a, b):
     return a + b
 
 
-# -------- TOOL DECLARATION --------
+# -------- TOOL SCHEMA --------
 
 tools = [
     types.Tool(
         function_declarations=[
             types.FunctionDeclaration(
                 name="get_weather",
-                description="Get weather",
+                description="Get real weather",
                 parameters={
                     "type": "OBJECT",
                     "properties": {"city": {"type": "STRING"}},
@@ -66,24 +61,6 @@ tools = [
 ]
 
 
-# -------- HELPER --------
-
-def get_text(resp):
-    if resp.text:
-        return resp.text
-
-    parts = resp.candidates[0].content.parts
-    return " ".join([p.text for p in parts if p.text]) or "No response"
-
-
-def get_function_call(resp):
-    parts = resp.candidates[0].content.parts
-    for p in parts:
-        if p.function_call:
-            return p.function_call
-    return None
-
-
 # -------- AGENT --------
 
 class Agent:
@@ -91,31 +68,41 @@ class Agent:
         self.name = name
         self.prompt = prompt
         self.client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-        self.model = "gemini-flash-latest"
+        self.model = "gemini-2.5-flash"
 
     def think(self, text):
+
         if not text:
             text = "continue"
+
+        contents = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=text)]
+            )
+        ]
 
         config = types.GenerateContentConfig(
             system_instruction=[types.Part.from_text(text=self.prompt)],
             tools=tools
         )
 
-        user_msg = types.Content(
-            role="user",
-            parts=[types.Part.from_text(text=text)]
-        )
-
-        resp = self.client.models.generate_content(
+        response = self.client.models.generate_content(
             model=self.model,
-            contents=[user_msg],
+            contents=contents,
             config=config
         )
 
-        fc = get_function_call(resp)
+        # -------- CHECK TOOL --------
 
-        # -------- TOOL CALL --------
+        fc = None
+        for p in response.candidates[0].content.parts:
+            if p.function_call:
+                fc = p.function_call
+                break
+
+        # -------- IF TOOL --------
+
         if fc:
             name, args = fc.name, fc.args
             print(f"\n⚙️ {self.name} -> {name} {args}")
@@ -129,7 +116,7 @@ class Agent:
 
             print(f"🔧 {result}")
 
-            tool_msg = types.Content(
+            tool_response = types.Content(
                 role="tool",
                 parts=[
                     types.Part.from_function_response(
@@ -142,20 +129,37 @@ class Agent:
             final = self.client.models.generate_content(
                 model=self.model,
                 contents=[
-                    user_msg,
-                    types.Content(role="model", parts=resp.candidates[0].content.parts),
-                    tool_msg
+                    contents[0],
+                    types.Content(
+                        role="model",
+                        parts=response.candidates[0].content.parts
+                    ),
+                    tool_response
                 ],
                 config=config
             )
 
-            out = get_text(final)
+            # -------- EXTRACT TEXT --------
+
+            if final.text:
+                output = final.text
+            else:
+                output = ""
+                for p in final.candidates[0].content.parts:
+                    if p.text:
+                        output += p.text
 
         else:
-            out = get_text(resp)
+            if response.text:
+                output = response.text
+            else:
+                output = ""
+                for p in response.candidates[0].content.parts:
+                    if p.text:
+                        output += p.text
 
-        print(out)
-        return out
+        print(output)
+        return output
 
 
 # -------- RUN --------
@@ -164,7 +168,7 @@ if __name__ == "__main__":
     human = Agent("Shashank", "You are a human")
     dog = Agent("Bruno", "You are a smart dog")
 
-    msg = "What's the weather in Chennai?"
+    msg = "What's the weather in London?"
 
     for _ in range(1):
         print(f"\nShashank:", end=" ")
