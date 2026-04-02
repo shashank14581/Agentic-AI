@@ -1,13 +1,36 @@
 import os
+import requests
 from google import genai
 from google.genai import types
 
 
 # -------- TOOLS --------
 
-def get_weather(city):
-    return f"Weather in {city} is 32°C"
-
+def get_weather(city: str) -> str:
+    # Step 1: geocode city name to lat/lon
+    geo = requests.get(
+        "https://geocoding-api.open-meteo.com/v1/search",
+        params={"name": city, "count": 1}
+    ).json()
+    
+    if not geo.get("results"):
+        return f"Could not find city: {city}"
+    
+    lat = geo["results"][0]["latitude"]
+    lon = geo["results"][0]["longitude"]
+    
+    # Step 2: get current temperature
+    weather = requests.get(
+        "https://api.open-meteo.com/v1/forecast",
+        params={
+            "latitude": lat,
+            "longitude": lon,
+            "current_weather": True
+        }
+    ).json()
+    
+    temp = weather["current_weather"]["temperature"]
+    return f"Weather in {city} is {temp}°C"
 def add_numbers(a, b):
     return a + b
 
@@ -143,7 +166,7 @@ if __name__ == "__main__":
 
     msg = "What's the weather in Chennai?"
 
-    for _ in range(3):
+    for _ in range(1):
         print(f"\nShashank:", end=" ")
         msg = human.think(msg)
 
