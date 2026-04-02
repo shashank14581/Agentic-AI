@@ -1,0 +1,143 @@
+import os
+import json
+from google import genai
+from google.genai import types
+
+# os.environ["GEMINI_API_KEY"] = "your_api_key"
+
+
+# -------- BASE AGENT --------
+
+class BaseAgent():
+    def __init__(self, name, sys_prompt, model="gemini-2.5-flash"):
+        self.name = name
+        self.sys_prompt = sys_prompt
+        self.memory = []
+        self.client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+        self.model = model
+
+    def think(self, input_text):
+        contents = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=input_text)]
+            )
+        ]
+        config = types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            system_instruction=[types.Part.from_text(text = self.sys_prompt)]
+        )
+        response = ""
+        for chunk in self.client.models.generate_content_stream(
+            model=self.model,
+            contents=contents,
+            config=config
+        ):
+            if chunk.text:
+                response += chunk.text
+        self.memory.append((input_text, response))
+        return response
+
+
+# -------- STRUCTURED AGENT --------
+# This agent is told to ONLY return JSON.
+# The sys_prompt is the contract — it defines the schema.
+
+class StructuredAgent(BaseAgent):
+    def __init__(self, name):
+        super().__init__(
+            name,
+            """You are a conversation analyst.
+
+Given a message, return ONLY a JSON object. No explanation, no markdown, no backticks.
+
+Schema:
+{
+  "speaker": "who is speaking (Human or Dog)",
+  "mood": "one word mood of the speaker",
+  "topic": "one sentence — what is being talked about",
+  "sentiment": "positive | negative | neutral",
+  "reply": "a natural reply from the other party"
+}
+
+Return only valid JSON. Nothing else."""
+        )
+
+    def think_structured(self, input_text):
+        raw = self.think(input_text)
+
+        # -------- SAFE JSON PARSE --------
+        # Model sometimes wraps in ```json ``` even when told not to.
+        # Strip it defensively.
+        clean = raw.strip()
+        if clean.startswith("```"):
+            clean = clean.split("```")[1]
+            if clean.startswith("json"):
+                clean = clean[4:]
+        clean = clean.strip()
+
+        try:
+            parsed = json.loads(clean)
+            return parsed
+        except json.JSONDecodeError:
+            # If parsing fails, return the raw text under an error key
+            return {"error": "Failed to parse JSON", "raw": raw}
+
+
+# -------- HUMAN AGENT --------
+
+class Human(BaseAgent):
+    def __init__(self, name):
+        super().__init__(
+            name,
+            f"You are {name}, you are a human. Talk naturally."
+        )
+
+
+# -------- DOG AGENT --------
+
+class Dog(BaseAgent):
+    def __init__(self, name):
+        super().__init__(
+            name,
+            f"You are {name}, you are a dog. Bark, be playful."
+        )
+
+
+# -------- ORCHESTRATE --------
+
+def orchestrate(human, dog, analyst, turns=3):
+    message = "Hi Dog!"
+
+    for i in range(turns):
+        print(f"\n{'='*50}")
+        print(f"Turn {i+1}")
+        print(f"{'='*50}")
+
+        # Human speaks
+        print(f"\n{human.name}: ", end="")
+        human_out = human.think(message)
+        print(human_out)
+
+        # Dog replies
+        print(f"\n{dog.name}: ", end="")
+        dog_out = dog.think(human_out)
+        print(dog_out)
+
+        # Analyst reads the dog's message and returns structured JSON
+        print(f"\n{analyst.name} analysis:")
+        structured = analyst.think_structured(dog_out)
+        print(json.dumps(structured, indent=2))
+
+        # Next turn starts from dog's reply
+        message = dog_out
+
+
+# -------- MAIN --------
+
+if __name__ == "__main__":
+    human = Human("Shashank")
+    dog = Dog("Bruno")
+    analyst = StructuredAgent("Analyst")
+
+    orchestrate(human, dog, analyst, turns=2)
