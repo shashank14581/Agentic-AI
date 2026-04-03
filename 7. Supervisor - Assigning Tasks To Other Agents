@@ -1,0 +1,176 @@
+import os
+import json
+from google import genai
+from google.genai import types
+
+#os.environ["GEMINI_API_KEY"] = "your_api_key"
+
+
+# -------- BASE AGENT --------
+
+class BaseAgent():
+    def __init__(self, name, sys_prompt, model="gemini-2.5-flash-lite"):
+        self.name = name
+        self.sys_prompt = sys_prompt
+        self.client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+        self.model = model
+        self.memory = []
+
+    def think(self, input_text, schema=None):
+
+        contents = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=input_text)]
+            )
+        ]
+
+        config = types.GenerateContentConfig(
+            system_instruction=[types.Part.from_text(text = self.sys_prompt)],
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            response_mime_type="application/json" if schema else None,
+            response_schema=schema
+        )
+
+        response = ""
+
+        for chunk in self.client.models.generate_content_stream(
+            model=self.model,
+            contents=contents,
+            config=config
+        ):
+            if chunk.text:
+                print(chunk.text, end="")
+                response += chunk.text
+
+        print()
+        self.memory.append((input_text, response))
+        return response
+
+
+# -------- SPECIALIZED "FUNCTION AGENTS" --------
+
+class Planner(BaseAgent):
+    def __init__(self):
+        super().__init__(
+            "Planner",
+            "You are a marketing strategist. Create a clear strategy."
+        )
+
+    def run(self, state):
+        return self.think(json.dumps(state))
+
+
+class Analyst(BaseAgent):
+    def __init__(self):
+        super().__init__(
+            "Analyst",
+            "You are a data analyst. Generate insights from the context."
+        )
+
+    def run(self, state):
+        return self.think(json.dumps(state))
+
+
+class Copywriter(BaseAgent):
+    def __init__(self):
+        super().__init__(
+            "Copywriter",
+            "You are a marketing copywriter. Write compelling campaign copy."
+        )
+
+    def run(self, state):
+        return self.think(json.dumps(state))
+
+
+# -------- SUPERVISOR --------
+
+class Supervisor(BaseAgent):
+    def __init__(self):
+        super().__init__(
+            "Supervisor",
+            """
+You are a supervisor managing a workflow.
+
+State contains:
+- task
+- strategy (optional)
+- insights (optional)
+- copy (optional)
+
+Rules:
+- If no strategy → planner
+- If strategy exists but no insights → analyst
+- If insights exist but no copy → copywriter
+- If all exist → done
+
+Return JSON:
+{ "next": "planner" | "analyst" | "copywriter" | "done" }
+"""
+        )
+
+        self.schema = {
+            "type": "object",
+            "properties": {
+                "next": {
+                    "type": "string",
+                    "enum": ["planner", "analyst", "copywriter", "done"]
+                }
+            },
+            "required": ["next"]
+        }
+
+    def route(self, state):
+        response = self.think(json.dumps(state), schema=self.schema)
+        return json.loads(response)["next"]
+
+
+# -------- ORCHESTRATION --------
+
+def orchestrate():
+
+    state = {
+        "task": "Increase conversion for email campaigns at Big Bazar",
+        "strategy": None,
+        "insights": None,
+        "copy": None
+    }
+
+    planner = Planner()
+    analyst = Analyst()
+    copywriter = Copywriter()
+    supervisor = Supervisor()
+
+    mapping = {
+        "planner": planner,
+        "analyst": analyst,
+        "copywriter": copywriter
+    }
+
+    while True:
+        print("\n Supervisor deciding...\n")
+
+        step = supervisor.route(state)
+
+        if step == "done":
+            print("\n Workflow complete\n")
+            break
+
+        agent = mapping[step]
+
+        print(f"\n{agent.name}: ", end="")
+        output = agent.run(state)
+
+        # -------- UPDATE STATE --------
+        if step == "planner":
+            state["strategy"] = output
+        elif step == "analyst":
+            state["insights"] = output
+        elif step == "copywriter":
+            state["copy"] = output
+
+
+# -------- MAIN --------
+
+if __name__ == "__main__":
+    orchestrate()
