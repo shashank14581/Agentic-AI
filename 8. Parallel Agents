@@ -1,0 +1,149 @@
+import os
+import asyncio
+from google import genai
+from google.genai import types
+import nest_asyncio
+ 
+# ── Base Agent (async-native, minimal abstraction) ───────────────────────────
+ 
+class BaseAgent:
+    def __init__(self, name: str, sys_prompt: str, model: str = "gemini-2.5-flash-lite"):
+        self.name = name
+        self.sys_prompt = sys_prompt
+        self.memory: list[tuple[str, str]] = []
+ 
+        self.client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        self.model = model
+ 
+        self._config = types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            system_instruction=[types.Part.from_text(text = self.sys_prompt)],
+        )
+ 
+    async def think(self, input_text: str) -> str:
+        contents = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=input_text)],
+            )
+        ]
+ 
+        response = ""
+ 
+        stream = await self.client.aio.models.generate_content_stream(
+            model=self.model,
+            contents=contents,
+            config=self._config,
+        )
+ 
+        async for chunk in stream:
+            if chunk.text:
+                print(chunk.text, end="", flush=True)
+                response += chunk.text
+ 
+        print()
+        self.memory.append((input_text, response))
+        return response
+ 
+ 
+# ── Agent Roles ───────────────────────────────────────────────────────────────
+ 
+class Analyst(BaseAgent):
+    def __init__(self, name: str, domain: str):
+        super().__init__(
+            name,
+            f"You are {name}, a sharp {domain} analyst. "
+            "Give a concise 2-sentence insight.",
+        )
+ 
+ 
+class Critic(BaseAgent):
+    def __init__(self, name: str):
+        super().__init__(
+            name,
+            f"You are {name}, a ruthless critic. "
+            "Identify the single biggest flaw. One sentence.",
+        )
+ 
+ 
+class Synthesizer(BaseAgent):
+    def __init__(self, name: str):
+        super().__init__(
+            name,
+            f"You are {name}, a synthesis engine. "
+            "Merge all inputs into one coherent paragraph.",
+        )
+ 
+ 
+# ── Stage 1 — Parallel Thinking (MAP) ────────────────────────────────────────
+ 
+async def run_parallel_analysts(topic: str) -> dict[str, str]:
+    analysts = [
+        Analyst("Riya",  "market economics"),
+        Analyst("Arjun", "geopolitical risk"),
+        Analyst("Meera", "technology adoption"),
+    ]
+ 
+    print(f"\n{'='*60}")
+    print(f"TOPIC: {topic}")
+    print(f"{'='*60}")
+    print("\n[Stage 1] Parallel thinking …\n")
+ 
+    async def run(agent: BaseAgent):
+        print(f"\n── {agent.name} ──")
+        return agent.name, await agent.think(topic)
+ 
+    results = await asyncio.gather(*[run(a) for a in analysts])
+    return dict(results)
+ 
+ 
+# ── Stage 2 — Parallel Critique (STRESS) ─────────────────────────────────────
+ 
+async def run_parallel_critics(analyst_outputs: dict[str, str]) -> dict[str, str]:
+    print("\n[Stage 2] Parallel critique …\n")
+ 
+    async def critique(name: str, text: str):
+        critic = Critic("Dev")
+        print(f"\n── Critic on {name} ──")
+        return name, await critic.think(f"{name} said: {text}")
+ 
+    results = await asyncio.gather(
+        *[critique(n, t) for n, t in analyst_outputs.items()]
+    )
+    return dict(results)
+ 
+ 
+# ── Stage 3 — Synthesis (REDUCE) ─────────────────────────────────────────────
+ 
+async def synthesize(analyst_outputs, critic_outputs) -> str:
+    print("\n[Stage 3] Synthesis …\n")
+ 
+    synth = Synthesizer("Priya")
+ 
+    combined = "\n".join(
+        f"{name}: {analysis}\n(Critique: {critic_outputs[name]})"
+        for name, analysis in analyst_outputs.items()
+    )
+ 
+    print("── Synthesizer ──")
+    return await synth.think(f"Merge these views:\n\n{combined}")
+ 
+ 
+# ── Main ──────────────────────────────────────────────────────────────────────
+ 
+async def main():
+    topic = "The rise of sovereign AI compute infrastructure in emerging economies"
+ 
+    analyst_outputs = await run_parallel_analysts(topic)
+    critic_outputs  = await run_parallel_critics(analyst_outputs)
+    final           = await synthesize(analyst_outputs, critic_outputs)
+ 
+    print("\n" + "="*60)
+    print("FINAL OUTPUT")
+    print("="*60)
+    print(final)
+ 
+nest_asyncio.apply()
+
+if __name__ == "__main__":
+    asyncio.run(main())
