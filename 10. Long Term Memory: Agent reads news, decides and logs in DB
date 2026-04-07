@@ -1,0 +1,195 @@
+# ================================
+# INSTALL DEPENDENCIES (Colab)
+# ================================
+#!pip install requests beautifulsoup4 feedparser
+
+
+
+# ================================
+# IMPORTS
+# ================================
+import os
+import sqlite3
+import requests
+import feedparser
+from bs4 import BeautifulSoup
+from google import genai
+from google.genai import types
+
+
+# ================================
+# DATABASE SETUP
+# ================================
+def init_db():
+    conn = sqlite3.connect("agent_memory.db")
+    cursor = conn.cursor()
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS memory (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        content TEXT,
+        source TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def save_to_db(content, source):
+    conn = sqlite3.connect("agent_memory.db")
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO memory (content, source)
+        VALUES (?, ?)
+    """, (content, source))
+
+    conn.commit()
+    conn.close()
+
+
+def load_memory(limit=5):
+    conn = sqlite3.connect("agent_memory.db")
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT content FROM memory
+        ORDER BY created_at DESC
+        LIMIT ?
+    """, (limit,))
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    return [r[0] for r in rows]
+
+
+# ================================
+# FETCH NEWS (BBC RSS)
+# ================================
+def fetch_news():
+    feed = feedparser.parse("http://feeds.bbci.co.uk/news/rss.xml")
+
+    articles = []
+    for entry in feed.entries[:5]:
+        articles.append({
+            "title": entry.title,
+            "link": entry.link
+        })
+
+    return articles
+
+
+# ================================
+# EXTRACT ARTICLE TEXT
+# ================================
+def extract_text(url):
+    try:
+        res = requests.get(url, timeout=5)
+        soup = BeautifulSoup(res.text, "html.parser")
+
+        paragraphs = soup.find_all("p")
+        text = " ".join([p.get_text() for p in paragraphs])
+
+        return text[:3000]  # trim to avoid token overflow
+    except:
+        return ""
+
+
+# ================================
+# AGENT
+# ================================
+class NewsAgent():
+    def __init__(self):
+        self.client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+        self.model = "gemini-2.5-flash"
+
+    def think(self, article_text, title):
+
+        # load past memory
+        memory = "\n".join(load_memory())
+
+        prompt = f"""
+You are an intelligent analyst.
+
+Existing knowledge:
+{memory}
+
+Read this news and extract ONLY important insights worth remembering.
+
+Rules:
+- Ignore noise
+- Keep it short (1-2 lines)
+- Only store meaningful facts or trends
+
+News Title:
+{title}
+
+News Content:
+{article_text}
+
+Return:
+- "SKIP" if nothing important
+- Otherwise return insight
+"""
+
+        contents = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text = prompt)]
+            )
+        ]
+
+        config = types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_budget=0)
+        )
+
+        response = ""
+
+        for chunk in self.client.models.generate_content_stream(
+            model=self.model,
+            contents=contents,
+            config=config
+        ):
+            if chunk.text:
+                print(chunk.text, end="")
+                response += chunk.text
+
+        print("\n")
+
+        return response.strip()
+
+
+# ================================
+# PIPELINE
+# ================================
+def run_pipeline():
+    init_db()
+    agent = NewsAgent()
+
+    articles = fetch_news()
+
+    for art in articles:
+        print(f"\n📰 Reading: {art['title']}")
+
+        text = extract_text(art["link"])
+
+        if not text:
+            print("Failed to extract text")
+            continue
+
+        insight = agent.think(text, art["title"])
+
+        if insight != "SKIP":
+            save_to_db(insight, art["link"])
+            print("Saved to DB")
+        else:
+            print("Skipped")
+
+
+# ================================
+# RUN
+# ================================
+run_pipeline()
