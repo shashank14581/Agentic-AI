@@ -1,0 +1,274 @@
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from google import genai
+from google.genai import types
+
+os.environ["GEMINI_API_KEY"] = "your_api_key"
+
+
+class SimpleEmbeddingModel(nn.Module):
+    def __init__(self, vocab_size, embedding_dim=32):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+
+    def forward(self, token_ids):
+        word_embeddings = self.embedding(token_ids)
+        return word_embeddings.mean(dim=0)
+
+
+class RAGMemory:
+    def __init__(self, embedding_dim=32):
+        self.word_to_id = {"<UNK>": 0}
+        self.embedding_dim = embedding_dim
+        self.model = None
+        self.store = []
+
+    def build_vocab(self, texts):
+        for text in texts:
+            for word in text.lower().split():
+                if word not in self.word_to_id:
+                    self.word_to_id[word] = len(self.word_to_id)
+
+    def encode_text(self, text):
+        token_ids = [
+            self.word_to_id.get(word, 0)
+            for word in text.lower().split()
+        ]
+        return torch.tensor(token_ids, dtype=torch.long)
+
+    def build_index(self, knowledge_base):
+        self.build_vocab(knowledge_base)
+
+        self.model = SimpleEmbeddingModel(
+            vocab_size=len(self.word_to_id),
+            embedding_dim=self.embedding_dim
+        )
+
+        for i, text in enumerate(knowledge_base, start=1):
+            token_ids = self.encode_text(text)
+
+            with torch.no_grad():
+                embedding = self.model(token_ids)
+
+            self.store.append({
+                "doc_id": f"doc_{i}",
+                "text": text,
+                "embedding": embedding
+            })
+
+            print(f"Indexed doc_{i}")
+
+    def retrieve(self, query, top_k=3):
+        query_ids = self.encode_text(query)
+
+        with torch.no_grad():
+            query_embedding = self.model(query_ids)
+
+        results = []
+
+        for item in self.store:
+            score = F.cosine_similarity(
+                query_embedding.unsqueeze(0),
+                item["embedding"].unsqueeze(0)
+            ).item()
+
+            results.append((score, item))
+
+        results = sorted(results, key=lambda x: x[0], reverse=True)
+
+        context = ""
+
+        for score, item in results[:top_k]:
+            context += f"""
+Document: {item["doc_id"]}
+Similarity: {round(score, 4)}
+Text: {item["text"]}
+"""
+
+        return context
+
+
+class BaseAgent:
+    def __init__(self, name, sys_prompt, model="gemini-2.5-flash"):
+        self.name = name
+        self.sys_prompt = sys_prompt
+        self.memory = []
+        self.client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+        self.model = model
+
+    def think(self, input_text, print_output=True):
+        contents = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=input_text)]
+            )
+        ]
+
+        config = types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            system_instruction=[types.Part.from_text(text = self.sys_prompt)]
+        )
+
+        response = ""
+
+        for chunk in self.client.models.generate_content_stream(
+            model=self.model,
+            contents=contents,
+            config=config
+        ):
+            if chunk.text:
+                if print_output:
+                    print(chunk.text, end="")
+                response += chunk.text
+
+        if print_output:
+            print()
+
+        self.memory.append((input_text, response))
+        return response
+
+
+class QueryPlannerAgent(BaseAgent):
+    def __init__(self):
+        super().__init__(
+            name="QueryPlannerAgent",
+            sys_prompt="""
+You are a query planning agent for Multi-hop RAG.
+
+Your job is to break a complex question into retrieval hops.
+
+Return only valid JSON in this format:
+
+{
+  "hops": [
+    "first retrieval query",
+    "second retrieval query"
+  ]
+}
+
+Rules:
+- Each hop should retrieve one missing piece of information.
+- Later hops may depend on earlier hops.
+- Do not answer the question.
+"""
+        )
+
+    def plan(self, question):
+        prompt = f"""
+Question:
+{question}
+
+Create retrieval hops.
+"""
+        response = self.think(prompt, print_output=False)
+        return response
+
+
+class MultiHopRAGAgent(BaseAgent):
+    def __init__(self, name, rag_memory):
+        super().__init__(
+            name=name,
+            sys_prompt="""
+You are a Multi-hop RAG Agent.
+
+You answer only after multiple retrieval steps.
+Use the retrieved evidence from all hops.
+Do not invent private facts.
+"""
+        )
+        self.rag_memory = rag_memory
+        self.planner = QueryPlannerAgent()
+
+    def think(self, question):
+        plan = self.planner.plan(question)
+
+        print("[Query Plan]")
+        print(plan)
+
+        try:
+            import json
+            hops = json.loads(plan)["hops"]
+        except Exception:
+            hops = [question]
+
+        all_context = ""
+
+        for i, hop_query in enumerate(hops, start=1):
+            print(f"\n[Hop {i}: {hop_query}]")
+
+            retrieved_context = self.rag_memory.retrieve(
+                query=hop_query,
+                top_k=2
+            )
+
+            print(retrieved_context)
+
+            all_context += f"""
+====================
+Hop {i}
+Query: {hop_query}
+Retrieved Context:
+{retrieved_context}
+====================
+"""
+
+        final_input = f"""
+You are answering using chained retrieval.
+
+Original Question:
+{question}
+
+Retrieved Evidence Across Hops:
+{all_context}
+
+Rules:
+- Combine evidence across hops.
+- Answer only from retrieved evidence.
+- If evidence is insufficient, say: "I do not have enough retrieved context to answer."
+"""
+
+        return super().think(final_input)
+
+
+def orchestrate(agent, questions):
+    for question in questions:
+        print(f"\nUser: {question}")
+        print(f"{agent.name}: ")
+        agent.think(question)
+
+
+if __name__ == "__main__":
+
+    knowledge_base = [
+        "Project Sarayu uses Blue Mango as its internal codename for the customer retention model.",
+        "Blue Mango uses three private signals: Lantern Score, River Index, and Basket Drift.",
+        "Lantern Score is owned by the Retention Analytics team.",
+        "River Index is owned by the Journey Intelligence team.",
+        "Basket Drift is owned by the Merchandising Science team.",
+        "The fallback owner for Blue Mango failures is Aniket from the DS Ops team.",
+        "If Blue Mango confidence drops below 0.62, the system must route the audience to manual review.",
+        "The manual review queue for Project Sarayu is called the Silver Gate queue.",
+        "Silver Gate is monitored by the DS Ops team.",
+        "The DS Ops team escalation lead is Meera.",
+        "Project Sarayu sends its final audience output to the table analytics_private.sarayu.final_audience.",
+        "The final audience table is consumed by the Campaign Activation layer.",
+        "Campaign Activation layer failures are handled by the Growth Platform team."
+    ]
+
+    rag_memory = RAGMemory(embedding_dim=32)
+    rag_memory.build_index(knowledge_base)
+
+    agent = MultiHopRAGAgent(
+        name="MultiHopRAGAgent",
+        rag_memory=rag_memory
+    )
+
+    questions = [
+        "Who monitors the queue used when Blue Mango confidence drops below 0.62?",
+        "Which teams own the signals used by Blue Mango?",
+        "Who handles failures in the layer that consumes Sarayu's final audience table?"
+    ]
+
+    orchestrate(agent, questions)
