@@ -1,0 +1,129 @@
+import os
+from google import genai
+from google.genai import types
+
+os.environ["GEMINI_API_KEY"] = "AIzaSyDLRmhIajunP4EbDVWyJp8BXk1T9OnZMoE"
+
+
+class SharedMemory:
+    def __init__(self):
+        self.store = []
+
+    def write(self, agent_name, input_text, output_text):
+        self.store.append({
+            "agent": agent_name,
+            "input": input_text,
+            "output": output_text
+        })
+
+    def read(self):
+        if not self.store:
+            return "No shared memory yet."
+
+        memory_text = ""
+        for i, item in enumerate(self.store, start=1):
+            memory_text += f"""
+Memory {i}
+Agent: {item['agent']}
+Input: {item['input']}
+Output: {item['output']}
+"""
+        return memory_text
+
+
+class BaseAgent:
+    def __init__(self, name, sys_prompt, shared_memory, model="gemini-2.5-flash-lite"):
+        self.name = name
+        self.sys_prompt = sys_prompt
+        self.shared_memory = shared_memory
+        self.client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+        self.model = model
+
+    def think(self, input_text):
+
+        memory_context = self.shared_memory.read()
+
+        final_input = f"""
+You have access to shared memory.
+
+Shared Memory:
+{memory_context}
+
+Current Input:
+{input_text}
+
+Respond as {self.name}.
+"""
+
+        contents = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=final_input)]
+            )
+        ]
+
+        config = types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            system_instruction=[types.Part.from_text(text = self.sys_prompt)]
+        )
+
+        response = ""
+
+        for chunk in self.client.models.generate_content_stream(
+            model=self.model,
+            contents=contents,
+            config=config
+        ):
+            if chunk.text:
+                print(chunk.text, end="")
+                response += chunk.text
+
+        print()
+
+        self.shared_memory.write(
+            agent_name=self.name,
+            input_text=input_text,
+            output_text=response
+        )
+
+        return response
+
+
+class Human(BaseAgent):
+    def __init__(self, name, shared_memory):
+        super().__init__(
+            name,
+            f"You are {name}, a human. Talk naturally.",
+            shared_memory
+        )
+
+
+class Dog(BaseAgent):
+    def __init__(self, name, shared_memory):
+        super().__init__(
+            name,
+            f"You are {name}, a dog. Bark, be playful.",
+            shared_memory
+        )
+
+
+def orchestrate(human, dog, turns=5):
+    message = "Hi Dog!"
+
+    for _ in range(turns):
+        print(f"\n{human.name}: ", end="")
+        human_out = human.think(message)
+
+        print(f"\n{dog.name}: ", end="")
+        dog_out = dog.think(human_out)
+
+        message = dog_out
+
+
+if __name__ == "__main__":
+    shared_memory = SharedMemory()
+
+    human = Human("Shashank", shared_memory)
+    dog = Dog("Bruno", shared_memory)
+
+    orchestrate(human, dog)
