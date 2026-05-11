@@ -1,0 +1,225 @@
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from google import genai
+from google.genai import types
+
+os.environ["GEMINI_API_KEY"] = "your_api_key"
+
+
+class SimpleEmbeddingModel(nn.Module):
+    def __init__(self, vocab_size, embedding_dim=32):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+
+    def forward(self, token_ids):
+        word_embeddings = self.embedding(token_ids)
+        return word_embeddings.mean(dim=0)
+
+
+class VectorSearchIndex:
+    def __init__(self):
+        self.documents = []
+
+    def add(self, doc_id, text, embedding):
+        self.documents.append({
+            "doc_id": doc_id,
+            "text": text,
+            "embedding": embedding
+        })
+
+    def search(self, query_embedding, top_k=3):
+        results = []
+
+        for doc in self.documents:
+            similarity = F.cosine_similarity(
+                query_embedding.unsqueeze(0),
+                doc["embedding"].unsqueeze(0)
+            ).item()
+
+            results.append((similarity, doc))
+
+        results = sorted(results, key=lambda x: x[0], reverse=True)
+        return results[:top_k]
+
+
+class VectorSearchMemory:
+    def __init__(self, embedding_dim=32):
+        self.word_to_id = {"<UNK>": 0}
+        self.embedding_dim = embedding_dim
+        self.model = None
+        self.index = VectorSearchIndex()
+
+    def build_vocab(self, texts):
+        for text in texts:
+            for word in text.lower().split():
+                if word not in self.word_to_id:
+                    self.word_to_id[word] = len(self.word_to_id)
+
+    def encode_text(self, text):
+        token_ids = [
+            self.word_to_id.get(word, 0)
+            for word in text.lower().split()
+        ]
+
+        return torch.tensor(token_ids, dtype=torch.long)
+
+    def build_index(self, texts):
+        self.build_vocab(texts)
+
+        self.model = SimpleEmbeddingModel(
+            vocab_size=len(self.word_to_id),
+            embedding_dim=self.embedding_dim
+        )
+
+        for i, text in enumerate(texts, start=1):
+            token_ids = self.encode_text(text)
+
+            with torch.no_grad():
+                embedding = self.model(token_ids)
+
+            self.index.add(
+                doc_id=f"doc_{i}",
+                text=text,
+                embedding=embedding
+            )
+
+            print(f"Indexed doc_{i}")
+
+    def retrieve(self, query, top_k=3):
+        token_ids = self.encode_text(query)
+
+        with torch.no_grad():
+            query_embedding = self.model(token_ids)
+
+        results = self.index.search(query_embedding, top_k=top_k)
+
+        context = ""
+
+        for score, doc in results:
+            context += f"""
+Document: {doc["doc_id"]}
+Similarity: {round(score, 4)}
+Text: {doc["text"]}
+"""
+
+        return context
+
+
+class BaseAgent:
+    def __init__(self, name, sys_prompt, vector_memory, model="gemini-flash-latest"):
+        self.name = name
+        self.sys_prompt = sys_prompt
+        self.vector_memory = vector_memory
+        self.client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+        self.model = model
+        self.memory = []
+
+    def think(self, question):
+
+        retrieved_context = self.vector_memory.retrieve(
+            query=question,
+            top_k=3
+        )
+
+        final_input = f"""
+You are using Vector Search before generation.
+
+Step 1: Retrieve relevant documents.
+Step 2: Use only retrieved documents to answer.
+
+Retrieved Documents:
+{retrieved_context}
+
+Question:
+{question}
+
+Answer only from the retrieved documents.
+If the retrieved documents do not contain the answer, say:
+"I do not have enough retrieved context to answer."
+"""
+
+        contents = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=final_input)]
+            )
+        ]
+
+        config = types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            system_instruction=[types.Part.from_text(text = self.sys_prompt)]
+        )
+
+        response = ""
+
+        for chunk in self.client.models.generate_content_stream(
+            model=self.model,
+            contents=contents,
+            config=config
+        ):
+            if chunk.text:
+                print(chunk.text, end="")
+                response += chunk.text
+
+        print()
+        self.memory.append((question, response))
+        return response
+
+
+class VectorSearchAgent(BaseAgent):
+    def __init__(self, name, vector_memory):
+        super().__init__(
+            name,
+            """
+You are a Vector Search RAG Agent.
+
+You always retrieve before generating.
+You answer only from retrieved context.
+You do not guess.
+""",
+            vector_memory
+        )
+
+
+def orchestrate(agent, questions):
+    for question in questions:
+        print(f"\nUser: {question}")
+        print(f"{agent.name}: ", end="")
+        agent.think(question)
+
+
+if __name__ == "__main__":
+
+    knowledge_base = [
+    "Project Sarayu uses Blue Mango as its internal codename for the customer retention model.",
+    "In Project Sarayu, the Blue Mango model is refreshed every Thursday at 2 AM IST.",
+    "The fallback owner for Blue Mango failures is Aniket from the DS Ops team.",
+    "Blue Mango uses three private signals: Lantern Score, River Index, and Basket Drift.",
+    "The River Index measures how sharply a customer's category interest changes over seven days.",
+    "Basket Drift is triggered when a customer's purchase pattern shifts away from their usual class cluster.",
+    "Lantern Score is used to identify customers who are likely to re-engage after a silent period.",
+    "Project Sarayu sends its final audience output to the table analytics_private.sarayu.final_audience.",
+    "If Blue Mango confidence drops below 0.62, the system must route the audience to manual review.",
+    "The manual review queue for Project Sarayu is called the Silver Gate queue."
+    "Project Sarayu is headed by Miss Moses."
+    ]
+
+    vector_memory = VectorSearchMemory(embedding_dim=32)
+    vector_memory.build_index(knowledge_base)
+
+    agent = VectorSearchAgent(
+        name="VectorSearchAgent",
+        vector_memory=vector_memory
+    )
+
+    questions = [
+    "What is Blue Mango?",
+    "Who owns Blue Mango failures?",
+    "What happens if confidence drops below 0.62?",
+    "What is the Silver Gate queue?"
+    "Who leads Project Sarayu?"
+    ]
+
+    orchestrate(agent, questions)
