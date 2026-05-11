@@ -1,0 +1,244 @@
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from google import genai
+from google.genai import types
+
+os.environ["GEMINI_API_KEY"] = "your_api_key"
+
+
+class Chunker:
+    def __init__(self, chunk_size=30, overlap=5):
+        self.chunk_size = chunk_size
+        self.overlap = overlap
+
+    def chunk_text(self, text):
+        words = text.split()
+        chunks = []
+        start = 0
+
+        while start < len(words):
+            end = start + self.chunk_size
+            chunks.append(" ".join(words[start:end]))
+            start = end - self.overlap
+
+            if start >= len(words):
+                break
+
+        return chunks
+
+
+class SimpleEmbeddingModel(nn.Module):
+    def __init__(self, vocab_size, embedding_dim=32):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+
+    def forward(self, token_ids):
+        word_embeddings = self.embedding(token_ids)
+        chunk_embedding = word_embeddings.mean(dim=0)
+        return chunk_embedding
+
+
+class VectorStore:
+    def __init__(self):
+        self.store = []
+
+    def add(self, chunk_id, text, embedding):
+        self.store.append({
+            "chunk_id": chunk_id,
+            "text": text,
+            "embedding": embedding
+        })
+
+    def search(self, query_embedding, top_k=2):
+        scores = []
+
+        for item in self.store:
+            score = F.cosine_similarity(
+                query_embedding.unsqueeze(0),
+                item["embedding"].unsqueeze(0)
+            ).item()
+
+            scores.append((score, item))
+
+        scores = sorted(scores, key=lambda x: x[0], reverse=True)
+        return scores[:top_k]
+
+
+class RAGMemory:
+    def __init__(self, chunk_size=30, overlap=5, embedding_dim=32):
+        self.chunker = Chunker(chunk_size, overlap)
+        self.embedding_dim = embedding_dim
+        self.word_to_id = {"<UNK>": 0}
+        self.model = None
+        self.vector_store = VectorStore()
+
+    def build_vocab(self, chunks):
+        for chunk in chunks:
+            for word in chunk.lower().split():
+                if word not in self.word_to_id:
+                    self.word_to_id[word] = len(self.word_to_id)
+
+    def encode_text(self, text):
+        token_ids = []
+
+        for word in text.lower().split():
+            token_ids.append(self.word_to_id.get(word, 0))
+
+        return torch.tensor(token_ids, dtype=torch.long)
+
+    def build_index(self, document):
+        chunks = self.chunker.chunk_text(document)
+        self.build_vocab(chunks)
+
+        self.model = SimpleEmbeddingModel(
+            vocab_size=len(self.word_to_id),
+            embedding_dim=self.embedding_dim
+        )
+
+        for i, chunk in enumerate(chunks, start=1):
+            token_ids = self.encode_text(chunk)
+
+            with torch.no_grad():
+                embedding = self.model(token_ids)
+
+            self.vector_store.add(
+                chunk_id=f"chunk_{i}",
+                text=chunk,
+                embedding=embedding
+            )
+
+            print(f"Stored chunk_{i}")
+
+    def retrieve(self, query, top_k=2):
+        token_ids = self.encode_text(query)
+
+        with torch.no_grad():
+            query_embedding = self.model(token_ids)
+
+        results = self.vector_store.search(query_embedding, top_k)
+
+        context = ""
+
+        for score, item in results:
+            context += f"""
+Chunk: {item["chunk_id"]}
+Score: {round(score, 4)}
+Text: {item["text"]}
+"""
+
+        return context
+
+
+class BaseAgent:
+    def __init__(self, name, sys_prompt, rag_memory, model="gemini-2.5-flash-lite"):
+        self.name = name
+        self.sys_prompt = sys_prompt
+        self.rag_memory = rag_memory
+        self.memory = []
+        self.client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+        self.model = model
+
+    def think(self, question):
+        retrieved_context = self.rag_memory.retrieve(question, top_k=2)
+
+        final_input = f"""
+You are answering using retrieved context from a RAG pipeline.
+
+Retrieved Context:
+{retrieved_context}
+
+User Question:
+{question}
+
+Answer only from the retrieved context.
+If the answer is not present, say you do not have enough context.
+"""
+
+        contents = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=final_input)]
+            )
+        ]
+
+        config = types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            system_instruction=[types.Part.from_text(text = self.sys_prompt)]
+        )
+
+        response = ""
+
+        for chunk in self.client.models.generate_content_stream(
+            model=self.model,
+            contents=contents,
+            config=config
+        ):
+            if chunk.text:
+                print(chunk.text, end="")
+                response += chunk.text
+
+        print()
+        self.memory.append((question, response))
+        return response
+
+
+class RAGAgent(BaseAgent):
+    def __init__(self, name, rag_memory):
+        super().__init__(
+            name,
+            """
+You are a RAG Agent.
+
+You answer user questions using retrieved chunks.
+You do not hallucinate.
+You only answer from the given context.
+""",
+            rag_memory
+        )
+
+
+def orchestrate(agent, questions):
+    for question in questions:
+        print(f"\nUser: {question}")
+        print(f"{agent.name}: ", end="")
+        agent.think(question)
+
+
+if __name__ == "__main__":
+
+    document = """
+    RAG systems do not work directly on entire documents.
+    First, documents are broken into smaller meaningful chunks.
+    Each chunk is then converted into an embedding vector.
+    These vectors are stored in a vector database.
+    When a user asks a question, the question is also embedded.
+    The system compares the query embedding with stored chunk embeddings.
+    The most similar chunks are retrieved and passed to the LLM as context.
+    This allows the LLM to answer using grounded information instead of guessing.
+    Chunking controls the memory boundaries of the system.
+    Embedding controls semantic meaning.
+    Together, chunking and embedding form the foundation of a RAG pipeline.
+    """
+
+    rag_memory = RAGMemory(
+        chunk_size=25,
+        overlap=5,
+        embedding_dim=32
+    )
+
+    rag_memory.build_index(document)
+
+    agent = RAGAgent(
+        name="RetrieverAgent",
+        rag_memory=rag_memory
+    )
+
+    questions = [
+        "Why do we chunk documents in RAG?",
+        "What happens when a user asks a question?",
+        "What does embedding control?"
+    ]
+
+    orchestrate(agent, questions)
