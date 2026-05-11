@@ -1,0 +1,43 @@
+!pip install -q "mcp[cli]" nest_asyncio
+
+import nest_asyncio
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+
+nest_asyncio.apply()
+
+
+MCP_URL = "http://127.0.0.1:8011/mcp"
+
+
+class MCPClient:
+    def __init__(self, url):
+        self.url = url
+
+    async def call_tool(self, tool_name, arguments):
+        async with streamablehttp_client(self.url) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+
+                result = await session.call_tool(
+                    name=tool_name,
+                    arguments=arguments
+                )
+
+                return result.content[0].text
+
+
+async def main():
+    client = MCPClient(MCP_URL)
+
+    result = await client.call_tool(
+        tool_name="search_private_knowledge",
+        arguments={
+            "query": "What is Blue Mango?"
+        }
+    )
+
+    print(result)
+
+
+await main()
