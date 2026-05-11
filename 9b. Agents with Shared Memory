@@ -2,7 +2,7 @@ import os
 from google import genai
 from google.genai import types
 
-os.environ["GEMINI_API_KEY"] = "AIzaSyDLRmhIajunP4EbDVWyJp8BXk1T9OnZMoE"
+os.environ["GEMINI_API_KEY"] = "your_api_key"
 
 
 class SharedMemory:
