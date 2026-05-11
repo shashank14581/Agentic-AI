@@ -1,0 +1,137 @@
+import os
+import json
+from google import genai
+from google.genai import types
+
+os.environ["GEMINI_API_KEY"] = "your_api_key"
+
+
+class KnowledgeStore:
+    def __init__(self):
+        self.entities = []
+
+    def write(self, agent_name, extracted_entities):
+        self.entities.append({
+            "agent": agent_name,
+            "entities": extracted_entities
+        })
+
+    def read(self):
+        if not self.entities:
+            return "No entities extracted yet."
+
+        return json.dumps(self.entities, indent=2)
+
+
+class BaseAgent:
+    def __init__(self, name, sys_prompt, knowledge_store, model="gemini-2.5-flash-lite"):
+        self.name = name
+        self.sys_prompt = sys_prompt
+        self.knowledge_store = knowledge_store
+        self.client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+        self.model = model
+
+    def think(self, input_text):
+
+        existing_knowledge = self.knowledge_store.read()
+
+        final_input = f"""
+Existing Knowledge Store:
+{existing_knowledge}
+
+Current Text:
+{input_text}
+
+Extract useful entities and return only valid JSON.
+"""
+
+        contents = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=final_input)]
+            )
+        ]
+
+        config = types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            system_instruction=[types.Part.from_text(text = self.sys_prompt)]
+        )
+
+        response = ""
+
+        for chunk in self.client.models.generate_content_stream(
+            model=self.model,
+            contents=contents,
+            config=config
+        ):
+            if chunk.text:
+                print(chunk.text, end="")
+                response += chunk.text
+
+        print()
+
+        try:
+            extracted_entities = json.loads(response)
+        except json.JSONDecodeError:
+            extracted_entities = {
+                "raw_response": response
+            }
+
+        self.knowledge_store.write(self.name, extracted_entities)
+
+        return extracted_entities
+
+
+class EntityExtractionAgent(BaseAgent):
+    def __init__(self, name, knowledge_store):
+        super().__init__(
+            name,
+            """
+You are an Entity Extraction Agent.
+
+Your job is to extract structured entities from raw text.
+
+Extract:
+- people
+- companies
+- locations
+- products
+- issues
+- actions
+- dates
+- relationships
+
+Return only valid JSON.
+Do not explain.
+""",
+            knowledge_store
+        )
+
+
+def orchestrate(agent, documents):
+    for i, document in enumerate(documents, start=1):
+        print(f"\n\nDocument {i}")
+        print("-" * 50)
+
+        agent.think(document)
+
+    print("\n\nFinal Knowledge Store")
+    print("=" * 50)
+    print(agent.knowledge_store.read())
+
+
+if __name__ == "__main__":
+    knowledge_store = KnowledgeStore()
+
+    extractor = EntityExtractionAgent(
+        name="EntityBuilder",
+        knowledge_store=knowledge_store
+    )
+
+    documents = [
+        "Customer Shashank bought a drill from Home Depot in Bengaluru and complained about delayed delivery.",
+        "Bruno visited the Koramangala store and purchased paint. The billing team helped him resolve a refund issue.",
+        "Aniket reported that the loyalty campaign for Pro customers had low engagement in March 2026."
+    ]
+
+    orchestrate(extractor, documents)
