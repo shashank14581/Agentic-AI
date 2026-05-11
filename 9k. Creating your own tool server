@@ -1,0 +1,54 @@
+!pip install -q "mcp[cli]" uvicorn nest_asyncio
+
+import time
+import socket
+import threading
+import nest_asyncio
+
+from mcp.server.fastmcp import FastMCP
+
+nest_asyncio.apply()
+
+
+PORT = 8012
+
+mcp = FastMCP(
+    name="simple_tool_server",
+    stateless_http=True,
+    json_response=True
+)
+
+
+@mcp.tool()
+def search_private_knowledge(query: str) -> str:
+    query = query.lower()
+
+    if "blue mango" in query:
+        return "Blue Mango is the internal codename for the customer retention model in Project Sarayu."
+
+    if "silver gate" in query:
+        return "Silver Gate is the manual review queue for Project Sarayu."
+
+    return "No matching private knowledge found."
+
+
+def run_mcp_server():
+    mcp.settings.port = PORT
+    mcp.run(transport="streamable-http")
+
+
+def port_is_busy(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+if not port_is_busy(PORT):
+    server_thread = threading.Thread(
+        target=run_mcp_server,
+        daemon=True
+    )
+    server_thread.start()
+    time.sleep(3)
+    print(f"MCP server started on port {PORT}.")
+else:
+    print(f"MCP server already running on port {PORT}.")
